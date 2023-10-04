@@ -1,0 +1,926 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create Simple Order Placement
+
+Parameters:
+  AlarmEmail:
+    Type: String
+    Description: SNS alarm email address
+
+Resources:
+  OrderPlacementLambda:
+    DependsOn: OrderPlacementLambdaRole
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: OrderPlacementLambda
+      Environment:
+        Variables:
+          AWS_REG: !Ref "AWS::Region"
+          AWS_ACC_ID: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              try:
+                  # Extract query string parameters
+                  event_type = event.get('queryStringParameters', {}).get('event', 'unknown')
+                  product_id = event.get('queryStringParameters', {}).get('productid')
+                  price = event.get('queryStringParameters', {}).get('price')
+                  qty = event.get('queryStringParameters', {}).get('qty')
+
+                  region = os.environ['AWS_REG']
+                  account_id = os.environ['AWS_ACC_ID']
+                  topic_arn = f'arn:aws:sns:{region}:{account_id}:OrderAlertsTopic'
+                  queue_url = f'https://sqs.{region}.amazonaws.com/{account_id}/OrdersQueue'
+
+                  # Send the order to SQS or SNS
+                  if event_type in ['payment_failure', 'out_of_stock']:
+                      # Send critical order issues to SNS
+                      sns = boto3.client('sns')
+                      sns.publish(TopicArn=topic_arn, Message="Order placement failure")
+                      return {
+                          "statusCode": 402,
+                          "body": "Message: Payment Failure"
+                      }
+
+                  # Check if 'product_id' exists in the query string
+                  if product_id is not None:
+                      order_data = {
+                          'product_id': product_id,
+                          'qty': qty,
+                          'price': price,
+                          'event_type': event_type
+                      }
+
+                      # Send all other orders to SQS
+                      sqs = boto3.client('sqs')
+                      sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(order_data))
+
+
+                      return {
+                          "statusCode": 200,
+                          "body": "Message: Order received"
+                      }
+                  else:
+                      error_message = f"Error: Missing 'productid' in query parameters. Requested values: event={event_type}, productid={product_id}, price={price}, quantity={qty}"
+                      return {
+                          "statusCode": 400,
+                          "body": error_message
+                      }
+              except Exception as e:
+                  # Handle exceptions and include the request details in the error message
+                  error_message = f"Error: {str(e)}. Requested values: event={event_type}, productid={product_id}, price={price}, quantity={qty}"
+                  return {
+                      "statusCode": 500,
+                      "body": error_message
+                  }
+
+
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt OrderPlacementLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+
+  OrderPlacementLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: OrderPlacementLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDescribeCluster
+                Effect: Allow
+                Action:
+                  - "sns:Publish"
+                  - "sqs:*"
+                Resource: "*"
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  OrderSuccessHandlerLambda:
+    DependsOn: OrderSuccessHandlerLambdaRole
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: OrderSuccessHandlerLambda
+      Environment:
+        Variables:
+          AWS_REG: !Ref "AWS::Region"
+          MAIL: !Ref "AlarmEmail"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+
+
+          def send_confirmation_email(email, subject, message):
+
+              region = os.environ['AWS_REG']
+              mail = os.environ['MAIL']
+              ses_client = boto3.client('ses', region_name='{region}')  # 
+
+              response = ses_client.send_email(
+                  Source='{mail}',  
+                  Destination={'ToAddresses': [email]},
+                  Message={
+                      'Subject': {'Data': subject},
+                      'Body': {'Text': {'Data': message}}
+                  }
+              )
+
+          def lambda_handler(event, context):
+              # Extract email, subject, and message from the event
+              email = event.get('email')
+              subject = event.get('subject', 'Confirmation Email')
+              message = event.get('message', 'Thank you for your order!')
+
+              try:
+                  # Send the confirmation email
+                  send_confirmation_email(email, subject, message)
+
+                  # Return a success response
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Confirmation email sent successfully')
+                  }
+              except Exception as e:
+                  # Handle exceptions and return an error response
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error sending confirmation email: {str(e)}')
+                  }
+
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt OrderSuccessHandlerLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+
+  ValidateOrderDetailsLambda:
+    DependsOn: ValidateOrderDetailsLambdaRole
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ValidateOrderDetailsLambda
+      Environment:
+        Variables:
+          AWS_REG: !Ref "AWS::Region"
+          AWS_ACC_ID: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+
+
+          def lambda_handler(event, context):
+              region = os.environ['AWS_REG']
+              account_id = os.environ['AWS_ACC_ID']
+              # Initialize SQS client
+              sqs_client = boto3.client('sqs')
+              queue_url = f'https://sqs.{region}.amazonaws.com/{account_id}/OrdersQueue'  
+
+              # Receive the latest message from the SQS queue
+              response = sqs_client.receive_message(
+                  QueueUrl=queue_url,
+                  AttributeNames=['All'],
+                  MessageAttributeNames=['All'],
+                  MaxNumberOfMessages=1,
+                  VisibilityTimeout=0,
+                  WaitTimeSeconds=0
+              )
+
+              # Get the first message or set it to None
+              message = response['Messages'][0] if 'Messages' in response else None
+
+              # Check if there's a message and it has a body
+              if message and 'Body' in message:
+                  try:
+                      # Parse the message body as JSON
+                      json_data = json.loads(message['Body'])
+
+                      # Check if 'product_id' exists in the parsed JSON
+                      if 'product_id' in json_data:
+                          return {
+                              "event": "Success"
+                          }
+                      else:
+                          return {
+                              "event": "Failed"
+                          }
+                  except json.JSONDecodeError:
+                      # Handle JSON decoding error
+                      pass
+
+              # If there's no valid JSON data or 'product_id', return the "Failed" event
+              return {
+                  "event": "Success"
+              }
+
+
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt ValidateOrderDetailsLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+
+  OrderProcessingLambda:
+    DependsOn: OrderProcessingLambdaRole
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: OrderProcessingLambda
+      Environment:
+        Variables:
+          AWS_REG: !Ref "AWS::Region"
+          AWS_ACC_ID: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: !Sub |
+              import json
+              import boto3
+              import os
+
+              def lambda_handler(event, context):
+                  try:
+                      # Check if 'Records' field is present in the event
+                      if 'Records' in event:
+                           message = event["Records"][0]["body"]
+                      else:
+                           message = "Message for testing"
+
+                      # Get the AWS region and account ID from environment variables
+                      region = os.environ.get('AWS_REG')
+                      account_id = os.environ.get('AWS_ACC_ID')
+
+                      # Start the Step Function
+                      step_functions_client = boto3.client("stepfunctions", region_name=region)
+                      response = step_functions_client.start_execution(
+                          stateMachineArn=f"arn:aws:states:{region}:{account_id}:stateMachine:OrderProcessingWorkflow",
+                          input=json.dumps({"message": message})
+                      )
+
+                      # Return a success response
+                      return {
+                          "statusCode": 200,
+                          "body": json.dumps("Step Function execution started successfully")
+                      }
+                  except Exception as e:
+                      # Handle any exceptions and return an error response
+                      return {
+                          "statusCode": 500,
+                          "body": json.dumps(f"Error: {str(e)}")
+                      }
+
+
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt OrderProcessingLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+
+  UpdateInventoryLambda:
+    DependsOn: UpdateInventoryLambdaRole
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UpdateInventoryLambda
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+            # Return a success response
+            return {
+              "statusCode": 200,
+
+            }
+
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt UpdateInventoryLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+
+  allerrors:
+    DependsOn: allerrorsRole
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: allerrors
+      Environment:
+        Variables:
+          AWS_REG: !Ref "AWS::Region"
+          AWS_ACC_ID: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+            try:
+              region = os.environ['AWS_REG']
+              account_id = os.environ['AWS_ACC_ID']
+              topic_arn = f'arn:aws:sns:{region}:{account_id}:OrderAlertsTopic'
+
+              forwarded_event = "Error: Validating order"
+
+              # Send the forwarded event to the SNS topic
+              sns_client = boto3.client('sns')
+              sns_client.publish(
+                TopicArn=topic_arn,
+                Message=json.dumps(forwarded_event)
+              )
+
+              # Return a success response
+              return {
+                "event": 200,
+                "body": json.dumps("Success")
+              }
+              pass
+            except Exception as e:
+               error_message = "Error: Validating order"
+
+              # Send an error message to the SNS topic
+              sns_client = boto3.client('sns')
+              sns_client.publish(
+                TopicArn=topic_arn,
+                Message=error_message
+              )
+
+               raise e
+
+             return {
+              "event": 200,
+              "body": json.dumps("Success")
+            }
+
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt allerrorsRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+
+  SimulatePaymentFailureLambda:
+    DependsOn: SimulatePaymentFailureLambdaRole
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SimulatePaymentFailureLambda
+      Code:
+        ZipFile: !Sub |
+              import json
+
+              def lambda_handler(event, context):
+                  global schema
+                  try:
+                      event_data = event.get("event")
+
+                      response = {
+                          "event": event_data
+                      }
+
+                      return response
+                  except Exception as e:
+                      return {
+                          "statusCode": 500,
+                          "body": json.dumps({"error": str(e)})
+                      }
+
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt SimulatePaymentFailureLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+
+  OrderSuccessHandlerLambdaRole:
+    DependsOn: OrderPlacementLambdaRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: OrderSuccessHandlerLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDescribeCluster
+                Effect: Allow
+                Action:
+                  - "ses:*"
+                Resource: "*"
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  OrderProcessingLambdaRole:
+    DependsOn: OrderSuccessHandlerLambdaRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: OrderProcessingLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AwsStepFunctiom
+                Effect: Allow
+                Action:
+                  - "states:*"
+                Resource: "*"
+              - Sid: Trigger
+                Effect: Allow
+                Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:ChangeMessageVisibility
+                Resource: !GetAtt OrdersQueue.Arn
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  ValidateOrderDetailsLambdaRole:
+    DependsOn: OrderProcessingLambdaRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: ValidateOrderDetailsLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SqSAccess
+                Effect: Allow
+                Action:
+                  - "sqs:*"
+                Resource: "*"
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  UpdateInventoryLambdaRole:
+    DependsOn: ValidateOrderDetailsLambdaRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: UpdateInventoryLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  allerrorsRole:
+    DependsOn: UpdateInventoryLambdaRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: allerrorsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDescribeCluster
+                Effect: Allow
+                Action:
+                  - "sns:*"
+                Resource: "*"
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  SimulatePaymentFailureLambdaRole:
+    DependsOn: allerrorsRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: SimulatePaymentFailureLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowWriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+ 
+
+  OrderPlacementLambdaPermission:
+      Type: "AWS::Lambda::Permission"
+      DependsOn:
+      - ApiGW
+      - OrderPlacementLambda
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !Ref OrderPlacementLambda
+        Principal: apigateway.amazonaws.com
+
+  ApiGW:
+    DependsOn: OrderPlacementLambda
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: OrderPlacementApi
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ProxyResourceANY
+    Properties:
+      Description: "root"
+      RestApiId: !Ref ApiGW
+      StageName: "order"
+
+  # ApiGWStage:
+  #   DependsOn: ApiDeployment
+  #   Type: "AWS::ApiGateway::Stage"
+  #   Properties:
+  #     StageName: order
+  #     Description: Default Stage
+  #     RestApiId: !Ref ApiGW
+  #     DeploymentId: !Ref ApiDeployment
+
+  ProxyResourceANY:
+    DependsOn: ApiGW
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGW
+      ResourceId: !GetAtt ApiGW.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrderPlacementLambda.Arn}/invocations
+
+  ######
+  ### HTTP GW
+  ######
+
+  # OrderPlacementLambdaIntegration:
+  #   Type: AWS::ApiGatewayV2::Integration
+  #   Properties:
+  #     ApiId: !Ref OrderApiGW
+  #     Description: Lambda Integration
+  #     IntegrationType: AWS_PROXY
+  #     IntegrationUri: !Join
+  #       - ''
+  #       - - 'arn:'
+  #         - !Ref 'AWS::Partition'
+  #         - ':apigateway:'
+  #         - !Ref 'AWS::Region'
+  #         - ':lambda:path/2015-03-31/functions/'
+  #         - !GetAtt OrderPlacementLambda.Arn
+  #         - /invocations
+  #     IntegrationMethod: POST
+  #     PayloadFormatVersion: '2.0'
+
+  # OrderPlacementAPIRoute:
+  #   DependsOn: OrderPlacementLambdaIntegration
+  #   Type: AWS::ApiGatewayV2::Route
+  #   Properties:
+  #     ApiId: !Ref OrderApiGW
+  #     RouteKey: ANY /
+  #     AuthorizationType: NONE
+  #     Target: !Join
+  #       - /
+  #       - - integrations
+  #         - !Ref OrderPlacementLambdaIntegration
+
+  ##
+  #### SNS SQS
+  ##
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrdersQueue
+      DelaySeconds: 0
+      VisibilityTimeout: 300
+  
+  LambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !GetAtt OrderProcessingLambda.Arn
+
+  OrderAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Order Alerts Topic
+      TopicName: OrderAlertsTopic
+      Subscription:
+        - Endpoint:
+            Ref: AlarmEmail
+          Protocol: email
+
+  OrderErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Order Error Notification Topic
+      TopicName: OrderErrorNotificationTopic
+      Subscription:
+        - Endpoint:
+            Ref: AlarmEmail
+          Protocol: email
+
+  #####
+  ## StepFunction
+  #####
+
+  OrderProcessStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: OrderProcessingWorkflow
+      DefinitionString: 
+            Fn::Sub: |
+                {
+                  "Comment": "Order Processing Workflow",
+                  "StartAt": "ValidateOrder",
+                  "States": {
+                    "ValidateOrder": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ValidateOrderDetailsLambda:$LATEST",
+                      "Next": "SimulatePaymentFailure",
+                      "Catch": [
+                        {
+                          "ErrorEquals": [
+                            "States.ALL"
+                          ],
+                          "Next": "errorHandles"
+                        }
+                      ]
+                    },
+                    "SimulatePaymentFailure": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SimulatePaymentFailureLambda:$LATEST",
+                      "Next": "PaymentStatus",
+                      "Catch": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException"
+                          ],
+                          "Next": "errorHandles"
+                        }
+                      ]
+                    },
+                    "PaymentStatus": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Not": {
+                            "Variable": "$.event",
+                            "StringEquals": "Success"
+                          },
+                          "Next": "OrderPlacementLambda"
+                        }
+                      ],
+                      "Default": "UpdateDB"
+                    },
+                    "UpdateDB": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:UpdateInventoryLambda:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "End": true
+                    },
+                    "OrderPlacementLambda": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:OrderPlacementLambda:$LATEST",
+                      "End": true
+                    },
+                    "errorHandles": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "Payload.$": "$",
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:allerrors:$LATEST"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                }
+
+      RoleArn: !GetAtt StepFunctionRole.Arn
+
+  StepFunctionRole:
+    DependsOn: allerrorsRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: StepFunctionInvokePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeFunction
+                Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                - !GetAtt ValidateOrderDetailsLambda.Arn
+                - !GetAtt UpdateInventoryLambda.Arn
+                - !GetAtt allerrors.Arn
+                - !GetAtt OrderPlacementLambda.Arn
+                - !GetAtt SimulatePaymentFailureLambda.Arn
+                - !Sub "${ValidateOrderDetailsLambda.Arn}:*"
+                - !Sub "${UpdateInventoryLambda.Arn}:*"
+                - !Sub "${allerrors.Arn}:*"
+                - !Sub "${OrderPlacementLambda.Arn}:*"
+                - !Sub "${SimulatePaymentFailureLambda.Arn}:*"
+            
+              - Sid: XRayAccessPolicy
+                Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                  - "xray:GetSamplingRules"
+                  - "xray:GetSamplingTargets"
+                Resource: "*"
+
+Outputs:
+  OrderPlacementApiEndpoint:
+    Description: "API Gateway Endpoint URL"
+    Value:
+      Fn::Sub: "https://${ApiGW}.execute-api.${AWS::Region}.amazonaws.com/order"
+
+  OrdersQueueUrl:
+    Description: "URL of the OrdersQueue"
+    Value:
+      Fn::GetAtt:
+        - OrdersQueue
+        - QueueUrl
+
+  OrdersQueueArn:
+    Description: "ARN of the OrderQue"
+    Value:
+      Fn::GetAtt:
+        - OrdersQueue
+        - Arn
+
+  OrderAlertsTopicArn:
+    Description: "ARN of the OrderAlertsTopic"
+    Value:
+      Fn::GetAtt:
+        - OrderAlertsTopic
+        - TopicArn
+
+  OrderErrorNotificationTopicArn:
+    Description: "ARN of the OrderErrorNotificationTopic"
+    Value:
+      Fn::GetAtt:
+        - OrderErrorNotificationTopic
+        - TopicArn
+
+  OrderPlacementLambdaArn:
+    Description: "ARN of the OrderPlacementLambda function"
+    Value:
+      Fn::GetAtt:
+        - OrderPlacementLambda
+        - Arn
