@@ -38,3 +38,8 @@ This will trigger a payment failure scenario, and the API will respond with:
     "body": "Message: Payment Failure"
 }
 ```
+
+
+### Diagram
+
+![N|Solid](scheme.png)
